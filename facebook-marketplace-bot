@@ -1,0 +1,300 @@
+# facebook_marketplace_bot.py
+import time
+import sqlite3
+import random
+import logging
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    ElementClickInterceptedException,
+    WebDriverException
+)
+
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('marketplace_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+
+class FacebookMarketplaceBot:
+    def __init__(self, email, password, search_keyword, custom_message,
+                 daily_limit=20, wait_before_close=False, location_name="Łódź"):
+        self.email = email
+        self.password = password
+        self.search_keyword = search_keyword
+        self.custom_message = custom_message
+        self.sent_item_ids = set()
+        self.daily_limit = daily_limit
+        self.wait_before_close = wait_before_close
+        self.location_name = location_name
+        self.driver = None
+        self.conn = None
+        self.cursor = None
+
+        self._initialize_driver()
+        self._initialize_database()
+
+    def _initialize_driver(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        chrome_options.add_argument("--start-maximized")
+        prefs = {"profile.managed_default_content_settings.images": 2}
+        chrome_options.add_experimental_option("prefs", prefs)
+
+        try:
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.navigator.chrome = {runtime: {}, etc: {}};
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                """
+            })
+        except WebDriverException as e:
+            logging.critical(f"Failed to initialize WebDriver: {e}")
+            raise
+
+    def _initialize_database(self):
+        try:
+            self.conn = sqlite3.connect("sent_messages.db")
+            self.cursor = self.conn.cursor()
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sent_messages (
+                    item_id TEXT PRIMARY KEY,
+                    message TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    responded INTEGER DEFAULT 0
+                )
+            """)
+            self.conn.commit()
+            self._load_sent_item_ids()
+        except sqlite3.Error as e:
+            logging.critical(f"Database error: {e}")
+            raise
+
+    def _load_sent_item_ids(self):
+        try:
+            self.cursor.execute("SELECT item_id FROM sent_messages")
+            rows = self.cursor.fetchall()
+            self.sent_item_ids = {row[0] for row in rows}
+        except sqlite3.Error as e:
+            logging.error(f"Error loading sent items: {e}")
+
+    def _random_delay(self, min_sec=1, max_sec=5):
+        time.sleep(random.uniform(min_sec, max_sec))
+
+    def login(self):
+        try:
+            self.driver.get("https://www.facebook.com")
+
+            try:
+                cookie_button = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(string(), 'Allow essential and optional cookies')]"))
+                )
+                cookie_button.click()
+                self._random_delay(2, 3)
+            except (NoSuchElementException, TimeoutException):
+                pass
+
+            email_field = WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.NAME, "email"))
+            )
+            email_field.send_keys(self.email)
+            self._random_delay(0.5, 1.5)
+
+            password_field = self.driver.find_element(By.NAME, "pass")
+            password_field.send_keys(self.password + Keys.RETURN)
+
+            try:
+                WebDriverWait(self.driver, 60).until(
+                    EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/marketplace/')]")
+                ))
+            except TimeoutException:
+                logging.warning("Login verification failed. CAPTCHA may have been triggered.")
+                input("\n⚠️ CAPTCHA detected or login failed. Please solve it manually then press Enter to continue...\n")
+
+        except Exception as e:
+            logging.error(f"Login failed: {e}")
+            raise
+
+    def search_marketplace(self):
+        try:
+            self.driver.get("https://www.facebook.com/marketplace")
+
+            search_box = WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Search Marketplace']"))
+            )
+            search_box.clear()
+            for char in self.search_keyword:
+                search_box.send_keys(char)
+                self._random_delay(0.1, 0.3)
+            search_box.send_keys(Keys.RETURN)
+            self._random_delay(3, 5)
+        except Exception as e:
+            logging.error(f"Marketplace search failed: {e}")
+            raise
+
+    def set_location(self):
+        try:
+            filter_button = WebDriverWait(self.driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH, "//span[contains(text(), 'Location')]/ancestor::div[@role='button']"))
+            )
+            filter_button.click()
+            self._random_delay(1, 2)
+
+            try:
+                clear_button = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, "//div[@aria-label='Clear']"))
+                )
+                clear_button.click()
+                self._random_delay(1, 2)
+            except (NoSuchElementException, TimeoutException):
+                pass
+
+            location_input = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Search for a location']"))
+            )
+            location_input.clear()
+            for char in self.location_name:
+                location_input.send_keys(char)
+                self._random_delay(0.1, 0.3)
+            location_input.send_keys(Keys.ARROW_DOWN)
+            location_input.send_keys(Keys.RETURN)
+            self._random_delay(1, 2)
+
+            apply_button = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//div[@aria-label='Apply']"))
+            )
+            apply_button.click()
+            self._random_delay(3, 5)
+
+        except Exception as e:
+            logging.error(f"Failed to set location: {e}")
+            raise
+
+    def scroll_to_load(self, scroll_count=5):
+        try:
+            for i in range(scroll_count):
+                self.driver.execute_script("window.scrollBy(0, 1000);")
+                self._random_delay(2, 4)
+        except Exception as e:
+            logging.error(f"Error during scrolling: {e}")
+
+    def send_message_to_listing(self, item_url, item_id):
+        try:
+            self.driver.execute_script(f"window.open('{item_url}');")
+            self.driver.switch_to.window(self.driver.window_handles[1])
+            self._random_delay(3, 5)
+
+            if item_id in self.sent_item_ids:
+                return False
+
+            try:
+                message_button = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[contains(@aria-label, 'Message')]"))
+                )
+            except TimeoutException:
+                logging.warning(f"Message button not found for item {item_id}. Skipping.")
+                return False
+
+            message_button.click()
+            self._random_delay(2, 3)
+
+            message_box = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//div[@aria-label='Message']"))
+            )
+            for char in self.custom_message:
+                message_box.send_keys(char)
+                self._random_delay(0.05, 0.15)
+            message_box.send_keys(Keys.RETURN)
+
+            self.cursor.execute(
+                "INSERT INTO sent_messages (item_id, message) VALUES (?, ?)",
+                (item_id, self.custom_message)
+            )
+            self.conn.commit()
+            self.sent_item_ids.add(item_id)
+
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to message {item_id}: {e}")
+            return False
+        finally:
+            self.driver.close()
+            self.driver.switch_to.window(self.driver.window_handles[0])
+            self._random_delay(1, 2)
+
+    def send_messages(self):
+        try:
+            listings = WebDriverWait(self.driver, 15).until(
+                EC.presence_of_all_elements_located((By.XPATH, "//a[contains(@href, '/marketplace/item/')]")
+            ))
+            count = 0
+
+            for listing in listings:
+                if count >= self.daily_limit:
+                    break
+
+                try:
+                    item_url = listing.get_attribute("href")
+                    item_id = item_url.split('/')[-2] if '/item/' in item_url else None
+                    if item_id and item_id not in self.sent_item_ids:
+                        if self.send_message_to_listing(item_url, item_id):
+                            count += 1
+                            self._random_delay(5, 10)
+                except Exception as e:
+                    logging.error(f"Error processing listing: {e}")
+                    continue
+
+            logging.info(f"Total messages sent: {count}")
+            return count
+
+        except Exception as e:
+            logging.error(f"Error in sending messages: {e}")
+            return 0
+
+    def run(self):
+        try:
+            self.login()
+            self.search_marketplace()
+            self.set_location()
+            self.scroll_to_load()
+            sent_count = self.send_messages()
+            logging.info(f"Finished. Sent {sent_count} messages.")
+        except Exception as e:
+            logging.critical(f"Bot failed: {e}", exc_info=True)
+        finally:
+            if self.wait_before_close:
+                input("\n✅ Finished sending messages. Press Enter to exit...\n")
+            if self.driver:
+                self.driver.quit()
+            if self.conn:
+                self.conn.close()
+
+if __name__ == "__main__":
+    CONFIG = {
+        "email": "username@example", # replace with your email
+        "password": "yourpassword",   #replace with your password
+        "search_keyword": "bicycle",
+        "custom_message": "Hello, is this item still available? I'm interested.",
+        "daily_limit": 20,
+        "wait_before_close": True,
+        "location_name": "Łódź"
+    }
+
+    bot = FacebookMarketplaceBot(**CONFIG)
+    bot.run()
